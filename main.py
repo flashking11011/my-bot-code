@@ -14,8 +14,6 @@ logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] Bl
 logger = logging.getLogger("BloxFruitsBot")
 
 TOKEN = os.getenv("BLOX_FRUITS_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
-# Optional: If you want to use an external AI API later, drop your key here
-AI_API_KEY = os.getenv("AI_API_KEY") 
 
 # Preserved Wiki & Fruit Catalogs
 WIKI_CATEGORIES: Dict[str, Dict[str, str]] = {
@@ -23,90 +21,111 @@ WIKI_CATEGORIES: Dict[str, Dict[str, str]] = {
 }
 
 intents = discord.Intents.default()
-intents.message_content = True  # Crucial for scanning chat back text triggers
+intents.message_content = True  
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
 # ----------------------------------------------------
-# 💬 XZVIER-STYLE CHAT BACK ENGINE
+# 🔍 WIKI SCRAPER & DATA PARSER
 # ----------------------------------------------------
-async def get_ai_chat_response(user_message: str, username: str) -> str:
+async def fetch_wiki_summary(page_title: str) -> tuple[str, str]:
     """
-    Processes plain-text conversational prompts. 
-    Can be easily hooked into Gemini, OpenAI, or a free Chatbot API.
+    Scrapes the Blox Fruits Wiki page to retrieve a summary paragraph and a primary thumbnail image.
     """
-    clean_msg = user_message.lower().strip()
+    base_url = f"https://fandom.com{page_title}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     
-    # 1. Custom context-aware localized triggers mimicking Xzvier's sassy personality
-    if any(word in clean_msg for word in ["hello", "hi", "hey", "yo"]):
-        return f"Yo {username}! 🏴‍☠️ What's the plan today? Grinding levels, hunting Sea Beasts, or checking the stock?"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(base_url, headers=headers, timeout=10) as response:
+                if response.status != 200:
+                    return f"Couldn't connect to the wiki page. (HTTP {response.status})", ""
+                
+                html = await response.text()
+                soup = BeautifulSoup(html, "html.parser")
+                
+                # Extract the primary image thumbnail
+                img_tag = soup.find("img", class_="pi-image-thumbnail") or soup.find("meta", property="og:image")
+                img_url = ""
+                if img_tag:
+                    img_url = img_tag.get("src") if img_tag.name == "img" else img_tag.get("content", "")
+                
+                # Extract first meaningful text paragraph (skipping infobox fields or empty lines)
+                content_div = soup.find("div", class_="mw-parser-output")
+                if not content_div:
+                    return "Wiki page structure could not be parsed.", img_url
+                    
+                paragraphs = content_div.find_all("p", recursive=False)
+                summary = ""
+                for p in paragraphs:
+                    text = p.get_text().strip()
+                    # Filter out short tracking snippets or empty elements
+                    if len(text) > 40 and not text.startswith("{"):
+                        # Strip Wikipedia citation brackets like, [2]
+                        summary = re.sub(r'\[\d+\]', '', text)
+                        break
+                
+                if not summary:
+                    summary = "No introductory description found on this wiki entry."
+                    
+                return summary, img_url
+    except Exception as e:
+        logger.error(f"Wiki scraping engine error: {e}")
+        return "An internal timeout or connection error occurred while querying the wiki database.", ""
+
+# ----------------------------------------------------
+# 🤖 PRODUCTION COMMAND OVERLAYS
+# ----------------------------------------------------
+@bot.tree.command(name="blox_info", description="Look up items, swords, or guides directly from the Blox Fruits Wiki!")
+@app_commands.describe(query="What item or game page do you want to look up?")
+async def blox_info(interaction: discord.Interaction, query: str):
+    # Immediate response deferral to allow up to 15 minutes of compute processing time for web scraping
+    await interaction.response.defer(thinking=True)
     
-    if "best fruit" in clean_msg:
-        return "Honestly? **Kitsune** for absolute PvP brainrot, **Buddha** if you actually want to get your grinding done, and **Dragon** if you are hoarding physical value values for trades! 🦊"
+    # Check if user query matches shorthand labels in WIKI_CATEGORIES, otherwise format string directly for URL insertion
+    target_page = query.strip().replace(" ", "_")
+    display_title = query.title()
     
-    if "wfl" in clean_msg or "trade" in clean_msg:
-        return "If you want me to calculate a trade value, use my `/trade_calc` or `.wfl` command so I can do the exact math for you! ⚖️"
+    for category, items in WIKI_CATEGORIES.items():
+        for custom_label, raw_link in items.items():
+            if query.lower() in custom_label.lower() or query.lower() in raw_link.lower():
+                target_page = raw_link
+                display_title = custom_label
+                break
+
+    # Execute asynchronous web scraper
+    summary_text, image_thumbnail = await fetch_wiki_summary(target_page)
+    
+    # Generate clean professional Discord Embed interface
+    embed = discord.Embed(
+        title=f"📖 Wiki Database: {display_title}",
+        url=f"https://fandom.com{target_page}",
+        description=summary_text if len(summary_text) <= 2048 else f"{summary_text[:2045]}...",
+        color=discord.Color.blue()
+    )
+    
+    if image_thumbnail:
+        embed.set_thumbnail(url=image_thumbnail)
         
-    if any(word in clean_msg for word in ["help", "commands", "cmds"]):
-        return "I can do a ton of things! Check out `/blox_info` to search the live wiki, `/stock` to see current fruits on sale, or `/trade_calc` to check your trade offers!"
-
-    # 2. OPTIONAL: External Cloud API Call Fallback (Uncomment & configure if you have a endpoint key)
-    # if AI_API_KEY:
-    #     try:
-    #         async with aiohttp.ClientSession() as session:
-    #             payload = {"contents": [{"parts": [{"text": f"You are a helpful, casual Blox Fruits Discord assistant named Master Bot. Answer this query cleanly: {user_message}"}]}]}
-    #             async with session.post(f"https://googleapis.com{AI_API_KEY}", json=payload) as resp:
-    #                 if resp.status == 200:
-    #                     result = await resp.json()
-    #                     return result['candidates'][0]['content']['parts'][0]['text']
-    #     except Exception as e:
-    #         logger.error(f"External Chat AI API error: {e}")
-
-    # 3. Default randomized organic conversational responses
-    import random
-    fallbacks = [
-        f"I hear you, {username}. But standard chat won't find a Mirage Island. Need me to look up wiki stats with `/blox_info` instead? 🏝️",
-        "My observation haki is active! What fruit are we hunting down right now? 👁️",
-        "That's wild! By the way, the fruit dealer changes his inventory every 4 hours. Don't forget to run `/stock check` to verify drops! 🛒",
-        "Interesting point... though I'd rather spend my Beli upgrading my swords at the Blacksmith! ⚔️"
-    ]
-    return random.choice(fallbacks)
+    embed.set_footer(text="Blox Fruits Wiki Assistant • Data pulled live from Fandom")
+    
+    # Edit the deferred placeholder message with the compiled data package
+    await interaction.followup.send(embed=embed)
 
 # ----------------------------------------------------
-# 🤖 BOT DISPATCH EVENT HANDLER
+# 💬 KEEP EXISTING EVENT HANDLERS BELOW
 # ----------------------------------------------------
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore automatic bot webhooks completely to eliminate endless infinite response loops
-    if message.author.bot:
-        return
-
-    # Check if the bot was explicitly mentioned OR replied to directly via message referencing
-    is_mentioned = bot.user in message.mentions
-    is_reply_to_me = message.reference and message.reference.cached_message and message.reference.cached_message.author == bot.user
-    
-    # Process prefix commands normally first if they start with standard symbols (e.g. !fruit)
+    if message.author.bot: return
     if message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
         return
-
-    # Trigger chat back sequences if they targeted the bot directly
-    if is_mentioned or is_reply_to_me:
-        # Clean text payload by removing the raw bot client mention ping string (e.g. <@1234455>)
-        clean_content = re.sub(r'<@!?\d+>', '', message.content).strip()
-        
-        # Emulate authentic human conversation workflows using Discord's asynchronous typing block indicators
-        async with message.channel.typing():
-            response_text = await get_ai_chat_response(clean_content, message.author.display_name)
-            
-            # Post response threading it as a neat direct inline reply map reference anchor
-            await message.reply(response_text)
-            return
 
 @bot.event
 async def on_ready():
     try:
         await bot.tree.sync()
-        logger.info("Application trees updated with structural layout variables.")
+        logger.info("Application commands successfully synchronized to active channels.")
     except Exception as e:
         logger.error(f"Sync error: {e}")
 
