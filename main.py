@@ -1,134 +1,197 @@
 import os
 import sys
 import logging
-import json
-import aiohttp
 import re
-from bs4 import BeautifulSoup
-from typing import Optional, List, Dict, Any
+import json
+import time
+import urllib.parse
+from typing import Optional, List, Dict, Any, Tuple
+
+# ----------------------------------------------------
+# 🛠️ SYSTEM ENVIRONMENT PATH SETUP
+# ----------------------------------------------------
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_root_dir = os.path.dirname(_this_dir)
+_libs_dir = os.path.join(_root_dir, "applet_python_libs")
+for p in [_libs_dir, _root_dir]:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from bs4 import BeautifulSoup
+    HAS_BS4 = True
+except ImportError:
+    HAS_BS4 = False
+
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] BloxFruitsBot: %(message)s")
-logger = logging.getLogger("BloxFruitsBot")
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] BloxGrandmaster: %(message)s")
+logger = logging.getLogger("BloxGrandmaster")
 
 TOKEN = os.getenv("BLOX_FRUITS_BOT_TOKEN") or os.getenv("DISCORD_TOKEN")
-
-# Preserved Wiki & Fruit Catalogs
-WIKI_CATEGORIES: Dict[str, Dict[str, str]] = {
-    "Swords": {"⚔️ True Triple Katana Crafting": "True_Triple_Katana"}
-}
-
-intents = discord.Intents.default()
-intents.message_content = True  
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+AI_API_KEY = os.getenv("AI_API_KEY")
 
 # ----------------------------------------------------
-# 🔍 WIKI SCRAPER & DATA PARSER
+# ⚙️ CONFIGURATION & DESIGNER OVERLAYS
 # ----------------------------------------------------
-async def fetch_wiki_summary(page_title: str) -> tuple[str, str]:
-    """
-    Scrapes the Blox Fruits Wiki page to retrieve a summary paragraph and a primary thumbnail image.
-    """
-    base_url = f"https://fandom.com{page_title}"
+XZVIER_CHANNEL_ID = 1540698357641519125  
+DESIGNER_USER_ID = 1325001135366471690   
+
+GLOBAL_AI_COOLDOWN = 10.0  
+USER_COOLDOWN_TRACKER: Dict[int, float] = {}  
+
+# ----------------------------------------------------
+# 🌐 DEEP LIVE DATABASE PARSER ENGINE (Market Values)
+# ----------------------------------------------------
+async def fetch_all_market_values() -> Dict[str, Dict[str, Any]]:
+    url = "https://bloxfruitsvalues.com"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    
+    market_data = {}
+
+    if not HAS_BS4: return market_data
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(base_url, headers=headers, timeout=10) as response:
-                if response.status != 200:
-                    return f"Couldn't connect to the wiki page. (HTTP {response.status})", ""
-                
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
+                if response.status != 200: return market_data
                 html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
+                soup = BeautifulSoup(html, 'html.parser')
                 
-                # Extract the primary image thumbnail
-                img_tag = soup.find("img", class_="pi-image-thumbnail") or soup.find("meta", property="og:image")
-                img_url = ""
-                if img_tag:
-                    img_url = img_tag.get("src") if img_tag.name == "img" else img_tag.get("content", "")
-                
-                # Extract first meaningful text paragraph (skipping infobox fields or empty lines)
-                content_div = soup.find("div", class_="mw-parser-output")
-                if not content_div:
-                    return "Wiki page structure could not be parsed.", img_url
+                for header in soup.find_all(['h3', 'h4', 'div', 'p', 'span']):
+                    name_text = header.get_text(strip=True)
+                    if not name_text or len(name_text) > 40: continue
                     
-                paragraphs = content_div.find_all("p", recursive=False)
-                summary = ""
-                for p in paragraphs:
-                    text = p.get_text().strip()
-                    # Filter out short tracking snippets or empty elements
-                    if len(text) > 40 and not text.startswith("{"):
-                        # Strip Wikipedia citation brackets like, [2]
-                        summary = re.sub(r'\[\d+\]', '', text)
-                        break
-                
-                if not summary:
-                    summary = "No introductory description found on this wiki entry."
+                    card = header.find_parent(class_=lambda x: x and any(k in x.lower() for k in ['card', 'item', 'value', 'row'])) or header.parent
+                    if not card: continue
+                    card_text = card.get_text(" ", strip=True)
                     
-                return summary, img_url
-    except Exception as e:
-        logger.error(f"Wiki scraping engine error: {e}")
-        return "An internal timeout or connection error occurred while querying the wiki database.", ""
+                    trade_val, perm_val, demand, trend = "Unknown", "N/A", "N/A", "Stable"
+                    money_vals = re.findall(r'(\d+(?:\.\d+)?\s*[MBKmbk])', card_text)
+                    if len(money_vals) >= 1: trade_val = money_vals.upper()
+                    if len(money_vals) >= 2: perm_val = money_vals.upper()
+                        
+                    demand_match = re.search(r'(?:Demand|Popularity)[:\s]*(\d+/\d+|\d+)', card_text, re.IGNORECASE)
+                    if demand_match: 
+                        demand = demand_match.group(1) if "/" in demand_match.group(1) else f"{demand_match.group(1)}/10"
+                    
+                    for status in ["Stable", "Overpaid", "Unstable", "Underpaid", "Hyped"]:
+                        if status.lower() in card_text.lower(): trend = status; break
+                    
+                    market_data[name_text.lower().strip()] = {
+                        "name": name_text, "trade_val": trade_val, "perm_val": perm_val, 
+                        "demand": demand, "trend": trend
+                    }
+    except Exception as e: logger.error(f"Global value scrape error: {e}")
+    return market_data
+
+async def fetch_fruit_detailed_value(search_query: str) -> Optional[Dict[str, str]]:
+    matrix = await fetch_all_market_values()
+    clean = search_query.lower().strip()
+    for key, data in matrix.items():
+        if clean == key:  
+            return {
+                "name": data["name"], "trade_val": data["trade_val"], "perm_val": data["perm_val"],
+                "demand": data["demand"], "rarity": "Fruit/Item", "trend": data["trend"],
+                "beli": "N/A", "robux": "N/A", "thumb": "https://bloxfruitsvalues.com",
+                "best_used": "PvP, Raids, Grinding & Marketplace Packages"
+            }
+    return None
 
 # ----------------------------------------------------
-# 🤖 PRODUCTION COMMAND OVERLAYS
+# 📖 DYNAMIC BLOX FRUITS FANDOM WIKI SCRAPER
 # ----------------------------------------------------
-@bot.tree.command(name="blox_info", description="Look up items, swords, or guides directly from the Blox Fruits Wiki!")
-@app_commands.describe(query="What item or game page do you want to look up?")
-async def blox_info(interaction: discord.Interaction, query: str):
-    # Immediate response deferral to allow up to 15 minutes of compute processing time for web scraping
-    await interaction.response.defer(thinking=True)
-    
-    # Check if user query matches shorthand labels in WIKI_CATEGORIES, otherwise format string directly for URL insertion
-    target_page = query.strip().replace(" ", "_")
-    display_title = query.title()
-    
-    for category, items in WIKI_CATEGORIES.items():
-        for custom_label, raw_link in items.items():
-            if query.lower() in custom_label.lower() or query.lower() in raw_link.lower():
-                target_page = raw_link
-                display_title = custom_label
-                break
+async def search_blox_wiki_content(query: str) -> Tuple[str, str]:
+    encoded_query = urllib.parse.quote_plus(query)
+    search_url = f"https://fandom.com{encoded_query}"
+    fallback_url = "https://fandom.com"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # Execute asynchronous web scraper
-    summary_text, image_thumbnail = await fetch_wiki_summary(target_page)
-    
-    # Generate clean professional Discord Embed interface
-    embed = discord.Embed(
-        title=f"📖 Wiki Database: {display_title}",
-        url=f"https://fandom.com{target_page}",
-        description=summary_text if len(summary_text) <= 2048 else f"{summary_text[:2045]}...",
-        color=discord.Color.blue()
-    )
-    
-    if image_thumbnail:
-        embed.set_thumbnail(url=image_thumbnail)
-        
-    embed.set_footer(text="Blox Fruits Wiki Assistant • Data pulled live from Fandom")
-    
-    # Edit the deferred placeholder message with the compiled data package
-    await interaction.followup.send(embed=embed)
+    if not HAS_BS4: return "BeautifulSoup4 missing.", fallback_url
 
-# ----------------------------------------------------
-# 💬 KEEP EXISTING EVENT HANDLERS BELOW
-# ----------------------------------------------------
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot: return
-    if message.content.startswith(bot.command_prefix):
-        await bot.process_commands(message)
-        return
-
-@bot.event
-async def on_ready():
     try:
-        await bot.tree.sync()
-        logger.info("Application commands successfully synchronized to active channels.")
-    except Exception as e:
-        logger.error(f"Sync error: {e}")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, headers=headers, timeout=6) as response:
+                if response.status != 200: return "", fallback_url
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+                
+                result_link = (
+                    soup.find('a', class_='unified-search__result__title') or 
+                    soup.find('a', class_='result-link')
+                )
+                target_url = result_link['href'] if result_link and result_link.has_attr('href') else fallback_url
 
-if __name__ == "__main__":
-    if not TOKEN: sys.exit("[ERROR] Run token missing.")
-    bot.run(TOKEN)
+            if target_url == fallback_url:
+                guess_slug = query.title().replace(" ", "_")
+                target_url = f"https://fandom.com{guess_slug}"
+
+            async with session.get(target_url, headers=headers, timeout=6) as content_response:
+                if content_response.status != 200: return "", fallback_url
+                page_html = await content_response.text()
+                
+                page_soup = BeautifulSoup(page_html, 'html.parser')
+                content_div = page_soup.find('div', class_='mw-parser-output')
+                if content_div:
+                    paragraphs = []
+                    for element in content_div.find_all(['p', 'h2', 'h3', 'li']):
+                        text = element.get_text(" ", strip=True)
+                        if text and len(text) > 10: paragraphs.append(text)
+                    return " ".join(paragraphs[:15])[:3800], target_url
+                return "", target_url
+    except Exception: return "", fallback_url
+
+# ----------------------------------------------------
+# 🎨 MULTIMODAL INVENTORY VISION MATRIX
+# ----------------------------------------------------
+async def process_multimodal_inventory_suggestion(
+    user_question: str, username: str, image_bytes: bytes, content_type: str, market_json: str
+) -> str:
+    if not AI_API_KEY: return "❌ Missing target AI_API_KEY credentials."
+    url = f"https://googleapis.com{AI_API_KEY}"
+    
+    system_prompt = (
+        f"You are Blox Grandmaster AI Intelligence. A user named '{username}' attached an image of their "
+        f"inventory and asked: '{user_question}'. Use the live marketplace logs to provide trading advice: \n"
+        f"--- LIVE MARKET DATA ---\n{market_json}\n------------------------\n"
+        f"Give structural hold/trade recommendations and keep the answer clear and under 5 sentences."
+    )
+
+    import base64
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    payload = {"contents": [{"parts": [{"text": system_prompt}, {"inlineData": {"mimeType": content_type, "data": base64_image}}]}], "generationConfig": {"maxOutputTokens": 450}}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=12) as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    return res['candidates']['content']['parts']['text'].strip()
+    except Exception: pass
+    return "Haki vision processing error. Ensure the image upload is legible."
+
+# ----------------------------------------------------
+# ⚙️ INTERACTIVE EMBED GENERATORS (Author Branding)
+# ----------------------------------------------------
+async def apply_designer_author_branding(embed: discord.Embed):
+    try:
+        designer = await bot.fetch_user(DESIGNER_USER_ID)
+        if designer:
+            embed.set_author(name=f"Blox Grandmaster Broker Engine", icon_url=designer.display_avatar.url)
+            current_footer = embed.footer.text or "Live Matrix Sync"
+            embed.set_footer(text=f"{current_footer} • Coded by {designer.name}", icon_url=designer.display_avatar.url)
+    except Exception:
+        embed.set_footer(text="Cosmic Values Live Matrix Sync • Coded by System Designer")
+
+def build_value_embed(data: Dict[str, str]) -> Tuple[discord.Embed, discord.ui.View]:
+    embed = discord.Embed(title=f"Blox Grandmaster AI Intelligence", description=f"**Live Values Profile • {data['name']}**", color=discord.Color.from_rgb(47, 49, 54))
+    embed.add_field(name="🔹 Physical Trade Value", value=data['trade_val'], inline=True)
+    embed.add_field(name="✨ Permanent Value", value=data['perm_val'], inline=True)
+    embed.add_field(name="🔥 Demand", value=data['demand'], inline=True)
+    embed.add_field(name="🛡️ Classification", value=data['rarity'], inline=True)
+    embed.add_field(name="Market Trend", value=data['trend'], inline=True)
+    embed.set_footer(text="🔗 Cosmic Values Matrix")
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Open Database Reference", url="https://bloxfruitsvalues.com", style=discord.ButtonStyle.link))
+    return embed, view
