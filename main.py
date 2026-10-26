@@ -217,3 +217,7 @@ async def merchant_stock_loop():
     for guild in bot.guilds:
         channel = discord.utils.get(guild.text_channels, name="blox-stock") or guild.text_channels
         try:
+    # Indented code goes here
+    pass 
+except Exception as e:
+    print(e)
